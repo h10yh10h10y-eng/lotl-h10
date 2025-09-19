@@ -173,16 +173,17 @@ class VectorKnowledgeBase:
 
     # ---- Index document
     def index_document(self, *, doc_id: str, filename: str, sha256: str, content_type: str, text: str, tags: Optional[List[str]] = None, pages: Optional[int] = None) -> Dict[str, Any]:
+        tags_csv = ",".join(tags) if tags else None
         chunks = self._chunk_text(text)
         if not chunks:
-            return {"doc_id": doc_id, "filename": filename, "sha256": sha256, "chunks": 0, "pages": pages, "content_type": content_type, "tags": tags or []}
+            return {"doc_id": doc_id, "filename": filename, "sha256": sha256, "chunks": 0, "pages": pages, "content_type": content_type, "tags": tags_csv}
         ids = [f"{doc_id}:{i}" for i in range(len(chunks))]
         metadatas = [{
             "doc_id": doc_id,
             "filename": filename,
             "sha256": sha256,
             "content_type": content_type,
-            "tags": tags or [],
+            "tags": tags_csv,
             "i": i,
         } for i in range(len(chunks))]
         self.coll.add(ids=ids, metadatas=metadatas, documents=chunks)
