@@ -203,7 +203,7 @@ class VectorKnowledgeBase:
     def search(self, query: str, top_k: int = TOP_K, threshold: float = SIM_THRESHOLD, where: Optional[Dict[str, Any]] = None, include_text: bool = True) -> List[Dict[str, Any]]:
         if not query.strip():
             return []
-        res = self.coll.query(query_texts=[query], n_results=top_k, where=where or {})
+        res = self.coll.query(query_texts=[query], n_results=top_k) if not where else self.coll.query(query_texts=[query], n_results=top_k, where=where)
         out = []
         for i in range(len(res.get("ids", [[]])[0])):
             score = None
@@ -596,9 +596,11 @@ class Handler(BaseHTTPRequestHandler):
             include_text = bool(body.get("include_text", True))
             if not query:
                 return self._send_json({"ok": True, "results": []})
-            where = {}
+            where = None
             for k in ("filename", "tags", "content_type", "doc_id"):
                 if k in filters:
+                    if where is None:
+                        where = {}
                     where[k] = {"$in": filters[k]} if isinstance(filters[k], list) else filters[k]
             results = get_vs().search(query, top_k=top_k, threshold=threshold, where=where, include_text=include_text)
             return self._send_json({"ok": True, "results": results})
