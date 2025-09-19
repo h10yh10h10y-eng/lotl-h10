@@ -16,3 +16,7 @@ files/uploads/
 
 # מערכת
 .DS_Store
+key/
+.env
+.env.*
+
