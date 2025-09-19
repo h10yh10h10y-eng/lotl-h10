@@ -21,3 +21,4 @@ key/
 .env.*
 
 !.env.example
+app_old.py
