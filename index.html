@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="he">
+<head>
+    <meta charset="utf-8">
+    <title>LORD OF THE LAND - Vector Store AI</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
+        .container { max-width: 900px; margin: 0 auto; background: white; border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.2); overflow: hidden; }
+        .header { background: linear-gradient(45deg, #667eea, #764ba2); color: white; padding: 30px; text-align: center; position: relative; }
+        .header h1 { font-size: 2.5em; margin: 0; }
+        .header p { margin: 10px 0 0 0; opacity: 0.9; }
+        .vector-indicator { position: absolute; top: 15px; left: 15px; background: rgba(255,255,255,0.2); padding: 8px 15px; border-radius: 20px; font-size: 12px; }
+        .refresh-btn { position: absolute; top: 15px; right: 15px; background: rgba(255,255,255,0.2); border: none; color: white; padding: 8px 15px; border-radius: 20px; cursor: pointer; font-size: 12px; }
+        .vector-info { background: #e8f4f8; padding: 15px; margin: 20px; border-radius: 10px; font-size: 12px; }
+        .chat-container { padding: 20px; display: flex; flex-direction: column; height: 75vh; }
+        .messages { flex: 1; overflow-y: auto; background: #f8f9fa; border-radius: 15px; padding: 20px; margin-bottom: 20px; }
+        .message { margin: 15px 0; padding: 15px; border-radius: 15px; max-width: 85%; word-wrap: break-word; white-space: pre-wrap; }
+        .user-message { background: #667eea; color: white; margin-left: 15%; }
+        .ai-message { background: white; border: 2px solid #e9ecef; margin-right: 15%; }
+        .sources-used { background: #e8f5e8; border: 1px solid #4caf50; padding: 10px; margin: 10px 0; border-radius: 8px; font-size: 12px; }
+        .input-area { display: flex; gap: 15px; align-items: flex-end; }
+        .input-box { flex: 1; padding: 15px; border: 2px solid #e9ecef; border-radius: 25px; font-size: 16px; outline: none; resize: none; min-height: 20px; max-height: 100px; }
+        .input-box:focus { border-color: #667eea; }
+        .send-btn { background: #667eea; color: white; border: none; padding: 15px 25px; border-radius: 25px; cursor: pointer; transition: all 0.3s ease; }
+        .send-btn:hover { background: #5a67d8; transform: translateY(-2px); }
+        .send-btn:disabled { background: #ccc; cursor: not-allowed; transform: none; }
+        .typing { color: #667eea; font-style: italic; padding: 15px; }
+        .controls { background: #f8f9fa; padding: 15px; border-radius: 10px; margin-bottom: 15px; }
+        .control-group { display: inline-block; margin: 5px 10px; }
+        .control-group label { font-size: 12px; color: #666; display: block; margin-bottom: 3px; }
+        .control-group select { padding: 5px; border: 1px solid #ddd; border-radius: 5px; font-size: 12px; }
+        .tokens-info { font-size: 11px; color: #888; margin-top: 5px; display: flex; justify-content: space-between; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="vector-indicator" id="vectorIndicator">🔍 טוען Vector Store...</div>
+            <button class="refresh-btn" onclick="refreshVectorStore()">🔄 רענן קבצים</button>
+            <h1>🏰 LORD OF THE LAND</h1>
+            <p>Vector Store AI + חיפוש סמנטי מתקדם</p>
+        </div>
+        
+        <div class="vector-info">
+            <strong>🚀 מערכת Vector Store חדשה:</strong><br>
+            🔍 <strong>חיפוש סמנטי:</strong> מבין משמעות, לא רק מילים<br>
+            ⚡ <strong>זיכרון 0:</strong> אין עוד crash של השרת!<br>
+            💰 <strong>זול:</strong> רק embeddings חד-פעמיים<br>
+            📚 <strong>חכם:</strong> מוצא מידע רלוונטי גם אם לא השתמשת במילים המדויקות<br>
+        </div>
+        
+        <div class="chat-container">
+            <div class="controls">
+                <div class="control-group">
+                    <label>מודל:</label>
+                    <select id="model">
+                        <option value="gpt-4o-mini" selected>GPT-4o Mini</option>
+                        <option value="gpt-4o">GPT-4o</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label>יצירתיות:</label>
+                    <select id="temperature">
+                        <option value="0.3">נמוכה</option>
+                        <option value="0.7" selected>בינונית</option>
+                        <option value="1.0">גבוהה</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label>אורך תשובה:</label>
+                    <select id="maxTokens">
+                        <option value="2000">קצר</option>
+                        <option value="4000" selected>בינוני</option>
+                        <option value="6000">ארוך</option>
+                    </select>
+                </div>
+            </div>
+            
+            <div class="messages" id="messages">
+                <div class="ai-message">
+                    <strong>🤖 יועץ Vector AI:</strong><br>
+                    שלום! אני יועץ תכנון ובניה עם מערכת Vector Store מתקדמת.<br><br>
+                    <strong>🔥 יכולות חדשות:</strong><br>
+                    🔍 <strong>חיפוש סמנטי:</strong> מבין את המשמעות של השאלה שלך<br>
+                    📚 <strong>זיכרון אינסופי:</strong> עוד לא יהיה crash מחוסר זיכרון<br>
+                    ⚡ <strong>מהיר:</strong> תוצאות מיידיות גם עם אלפי מסמכים<br>
+                    💰 <strong>חסכוני:</strong> פחות עלויות API<br><br>
+                    <em>שאל אותי כל שאלה על תכנון ובניה - אני אמצא את המידע הרלוונטי!</em>
+                </div>
+            </div>
+            
+            <div class="input-area">
+                <textarea id="messageInput" class="input-box" placeholder="שאל שאלה... המערכת תחפש בחכמה במסמכים!" onkeypress="handleEnter(event)"></textarea>
+                <button id="sendBtn" class="send-btn" onclick="sendMessage()">📤 שלח</button>
+            </div>
+            <div class="tokens-info" id="tokensInfo">
+                <span>Vector Store מוכן לחיפוש חכם</span>
+                <span id="vectorStatus"></span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let chatHistory = [];
+        let totalTokens = 0;
+        let vectorStats = {};
+
+        async function loadVectorStats() {
+            try {
+                const response = await fetch('/api/stats');
+                const data = await response.json();
+                
+                const indicator = document.getElementById('vectorIndicator');
+                indicator.textContent = `🔍 ${data.total_chunks} קטעים בVector Store`;
+                
+                const status = document.getElementById('vectorStatus');
+                status.textContent = `Vector Store: ${data.total_chunks} קטעים`;
+                
+                vectorStats = data;
+            } catch (error) {
+                console.error('שגיאה בטעינת סטטיסטיקות:', error);
+            }
+        }
+
+        async function refreshVectorStore() {
+            try {
+                const response = await fetch('/api/refresh', { method: 'POST' });
+                const data = await response.json();
+                alert(data.message);
+                loadVectorStats();
+            } catch (error) {
+                alert('שגיאה ברענון Vector Store');
+            }
+        }
+
+        document.getElementById('messageInput').addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = (this.scrollHeight) + 'px';
+        });
+
+        function handleEnter(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+            }
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const sendBtn = document.getElementById('sendBtn');
+            const message = input.value.trim();
+            if (!message) return;
+
+            const model = document.getElementById('model').value;
+            const temperature = parseFloat(document.getElementById('temperature').value);
+            const maxTokens = parseInt(document.getElementById('maxTokens').value);
+
+            addMessage(message, 'user');
+            input.value = '';
+            input.style.height = 'auto';
+            
+            sendBtn.disabled = true;
+            sendBtn.textContent = '🔍 חיפוש וחשיבה...';
+            showTyping();
+            
+            try {
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        message: message, 
+                        history: chatHistory,
+                        settings: {
+                            model: model,
+                            temperature: temperature,
+                            max_tokens: maxTokens
+                        }
+                    })
+                });
+
+                const data = await response.json();
+                hideTyping();
+                
+                if (data.success) {
+                    let responseWithSources = data.response;
+                    
+                    if (data.sources && data.sources.length > 0) {
+                        let sourcesInfo = '<div class="sources-used">📚 <strong>מקורות:</strong> ';
+                        sourcesInfo += data.sources.map(source => source.filename).join(', ');
+                        sourcesInfo += '</div>';
+                        responseWithSources += sourcesInfo;
+                    }
+                    
+                    addMessage(responseWithSources, 'ai');
+                    chatHistory.push({user: message, ai: data.response});
+                    if (chatHistory.length > 10) chatHistory = chatHistory.slice(-10);
+                    
+                    totalTokens += data.tokens_used || 0;
+                    document.getElementById('tokensInfo').innerHTML = 
+                        `<span>טוקנים: ${data.tokens_used || 0} | סה"כ: ${totalTokens}</span><span>Vector: ${vectorStats.total_chunks || 0} קטעים</span>`;
+                } else {
+                    addMessage('❌ שגיאה: ' + data.error, 'ai');
+                }
+            } catch (error) {
+                hideTyping();
+                addMessage('❌ שגיאת תקשורת: ' + error.message, 'ai');
+            }
+            
+            sendBtn.disabled = false;
+            sendBtn.textContent = '📤 שלח';
+        }
+
+        function addMessage(content, type) {
+            const messages = document.getElementById('messages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${type}-message`;
+            messageDiv.innerHTML = type === 'user' ? 
+                `<strong>👤 אתה:</strong><br>${content}` : 
+                `<strong>🤖 Vector AI:</strong><br>${content}`;
+            messages.appendChild(messageDiv);
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function showTyping() {
+            const messages = document.getElementById('messages');
+            const typingDiv = document.createElement('div');
+            typingDiv.id = 'typing';
+            typingDiv.className = 'typing';
+            typingDiv.textContent = '🔍 מחפש במסמכים וחושב...';
+            messages.appendChild(typingDiv);
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function hideTyping() {
+            const typing = document.getElementById('typing');
+            if (typing) typing.remove();
+        }
+
+        window.onload = loadVectorStats;
+    </script>
+</body>
+</html>

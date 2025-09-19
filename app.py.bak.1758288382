@@ -1,0 +1,844 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+LOTL app.py — Minimal HTTP server + Vector Store API
+- No framework (http.server) to keep parity with current setup
+- Reads config exclusively from ENV (see .env.example)
+- ChromaDB persistent collection with OpenAI embeddings
+- Endpoints (prefixed with /api/vs): stats, search, index, batch, refresh, documents, chunks, purge, export/import
+- Upload limit: MAX_UPLOAD_MB (default 100MB)
+- Optional OCR for images (pytesseract); graceful degradation when libs missing
+- Auth: require X-LOT-KEY header if LOT_API_SECRET env is non-empty (all endpoints except /health)
+
+Note: This is a pragmatic, single-file implementation. For production, consider FastAPI.
+"""
+
+from __future__ import annotations
+import os, sys, io, re, json, csv, time, math, mimetypes, hashlib, traceback
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ---- Optional dotenv
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
+# ---- ENV / Config
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+PORT = int(os.getenv("PORT", "8080"))
+FILES_DIR = Path(os.getenv("FILES_DIR", "./files/uploads")).resolve()
+DB_PATH = Path(os.getenv("DB_PATH", "./chroma_db")).resolve()
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "lotl_docs")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-large")
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+TIMEOUT_S = int(os.getenv("TIMEOUT_S", "60"))
+TOP_K = int(os.getenv("TOP_K", "5"))
+SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.2"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+LOT_API_SECRET = os.getenv("LOT_API_SECRET", "").strip()
+CORS_ALLOW_ORIGINS = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()]
+OCR_ENABLED = os.getenv("OCR_ENABLED", "true").lower() == "true"
+OCR_LANG = os.getenv("OCR_LANG", "heb+eng")
+VISION_ENABLED = os.getenv("VISION_ENABLED", "true").lower() == "true"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# ---- Best-effort dependencies
+missing: List[str] = []
+try:
+    import chromadb  # type: ignore
+    from chromadb.utils import embedding_functions  # type: ignore
+except Exception:
+    chromadb = None
+    embedding_functions = None  # type: ignore
+    missing.append("chromadb")
+
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:
+    OpenAI = None  # type: ignore
+    missing.append("openai")
+
+try:
+    import PyPDF2  # type: ignore
+except Exception:
+    PyPDF2 = None  # type: ignore
+
+try:
+    import docx  # python-docx
+except Exception:
+    docx = None  # type: ignore
+
+try:
+    from PIL import Image  # type: ignore
+except Exception:
+    Image = None  # type: ignore
+
+try:
+    import pytesseract  # type: ignore
+except Exception:
+    pytesseract = None  # type: ignore
+
+try:
+    import pandas as pd  # type: ignore
+except Exception:
+    pd = None  # type: ignore
+
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None  # type: ignore
+
+# ---- OpenAI client (lazy)
+_client: Optional[OpenAI] = None
+
+def get_client() -> OpenAI:
+    global _client
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY")
+    if _client is None:
+        if OpenAI is None:
+            raise RuntimeError("Missing 'openai' Python package")
+        _client = OpenAI(api_key=OPENAI_API_KEY)
+    return _client
+
+# ---- Chroma Vector Store (singleton)
+_vs = None
+
+class VectorKnowledgeBase:
+    def __init__(self, db_path: Path, collection: str):
+        if chromadb is None or embedding_functions is None:
+            raise RuntimeError("Missing 'chromadb' package")
+        self.db_path = db_path
+        self.db_path.mkdir(parents=True, exist_ok=True)
+        self.client = chromadb.PersistentClient(path=str(self.db_path))
+        self.embed_fn = embedding_functions.OpenAIEmbeddingFunction(
+            api_key=OPENAI_API_KEY,
+            model_name=EMBED_MODEL,
+        )
+        self.coll = self.client.get_or_create_collection(
+            name=collection,
+            embedding_function=self.embed_fn,
+            metadata={"created_at": datetime.utcnow().isoformat()}
+        )
+        # lightweight docs index on filesystem
+        self.docs_index_path = self.db_path / "docs_index.json"
+        if not self.docs_index_path.exists():
+            self._save_docs_index({"items": [], "updated_at": datetime.utcnow().isoformat()})
+
+    # ---- Docs index helpers
+    def _load_docs_index(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self.docs_index_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"items": [], "updated_at": datetime.utcnow().isoformat()}
+
+    def _save_docs_index(self, data: Dict[str, Any]) -> None:
+        self.docs_index_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _upsert_doc(self, doc: Dict[str, Any]) -> None:
+        idx = self._load_docs_index()
+        items = idx.get("items", [])
+        # dedupe by doc_id
+        items = [d for d in items if d.get("doc_id") != doc.get("doc_id")]
+        items.append(doc)
+        idx["items"] = items
+        idx["updated_at"] = datetime.utcnow().isoformat()
+        self._save_docs_index(idx)
+
+    def _remove_doc(self, doc_id: str) -> None:
+        idx = self._load_docs_index()
+        items = [d for d in idx.get("items", []) if d.get("doc_id") != doc_id]
+        idx["items"] = items
+        idx["updated_at"] = datetime.utcnow().isoformat()
+        self._save_docs_index(idx)
+
+    # ---- Chunking
+    def _chunk_text(self, text: str) -> List[str]:
+        if not text:
+            return []
+        words = text.split()
+        chunks = []
+        step = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
+        for i in range(0, len(words), step):
+            chunk = " ".join(words[i:i+CHUNK_SIZE])
+            if chunk.strip():
+                chunks.append(chunk)
+        return chunks
+
+    # ---- Index document
+    def index_document(self, *, doc_id: str, filename: str, sha256: str, content_type: str, text: str, tags: Optional[List[str]] = None, pages: Optional[int] = None) -> Dict[str, Any]:
+        chunks = self._chunk_text(text)
+        if not chunks:
+            return {"doc_id": doc_id, "filename": filename, "sha256": sha256, "chunks": 0, "pages": pages, "content_type": content_type, "tags": tags or []}
+        ids = [f"{doc_id}:{i}" for i in range(len(chunks))]
+        metadatas = [{
+            "doc_id": doc_id,
+            "filename": filename,
+            "sha256": sha256,
+            "content_type": content_type,
+            "tags": tags or [],
+            "i": i,
+        } for i in range(len(chunks))]
+        self.coll.add(ids=ids, metadatas=metadatas, documents=chunks)
+        self._upsert_doc({
+            "doc_id": doc_id,
+            "filename": filename,
+            "sha256": sha256,
+            "size": None,
+            "pages": pages,
+            "content_type": content_type,
+            "tags": tags or [],
+            "created_at": datetime.utcnow().isoformat()
+        })
+        return {"doc_id": doc_id, "filename": filename, "sha256": sha256, "chunks": len(chunks), "pages": pages, "content_type": content_type, "tags": tags or []}
+
+    # ---- Search
+    def search(self, query: str, top_k: int = TOP_K, threshold: float = SIM_THRESHOLD, where: Optional[Dict[str, Any]] = None, include_text: bool = True) -> List[Dict[str, Any]]:
+        if not query.strip():
+            return []
+        res = self.coll.query(query_texts=[query], n_results=top_k, where=where or {})
+        out = []
+        for i in range(len(res.get("ids", [[]])[0])):
+            score = None
+            try:
+                # Chroma returns distances in "distances" if using mmr; if not available, skip.
+                score = float(res.get("distances", [[None]])[0][i]) if res.get("distances") else None
+            except Exception:
+                score = None
+            meta = res["metadatas"][0][i] if res.get("metadatas") else {}
+            item = {
+                "doc_id": meta.get("doc_id"),
+                "filename": meta.get("filename"),
+                "score": score,
+                "excerpt": (res["documents"][0][i] if (include_text and res.get("documents")) else None),
+                "content_type": meta.get("content_type"),
+                "tags": meta.get("tags", [])
+            }
+            out.append(item)
+        return out
+
+    # ---- Chunks by document
+    def list_chunks(self, doc_id: str, offset: int = 0, limit: int = 50, with_text: bool = True) -> Dict[str, Any]:
+        res = self.coll.get(where={"doc_id": doc_id}, include=["metadatas", "documents"] if with_text else ["metadatas"], limit=limit, offset=offset)
+        items = []
+        docs = res.get("documents", [[]])[0] if res.get("documents") else []
+        metas = res.get("metadatas", [[]])[0] if res.get("metadatas") else []
+        for i, m in enumerate(metas):
+            items.append({"i": m.get("i"), "metadata": m, "text": docs[i] if with_text and i < len(docs) else None})
+        total = len(self.coll.get(where={"doc_id": doc_id}).get("ids", [[]])[0])
+        return {"ok": True, "total": total, "items": items}
+
+    # ---- Delete document
+    def delete_document(self, doc_id: str) -> int:
+        res = self.coll.delete(where={"doc_id": doc_id})
+        self._remove_doc(doc_id)
+        return res  # chroma returns None or dict depending on version
+
+    # ---- Stats
+    def stats(self) -> Dict[str, Any]:
+        idx = self._load_docs_index()
+        total_docs = len(idx.get("items", []))
+        # count chunks (best effort)
+        try:
+            chunks = self.coll.count()  # may count all; acceptable as approximation
+        except Exception:
+            chunks = None
+        return {
+            "ok": True,
+            "collection": COLLECTION_NAME,
+            "db_path": str(self.db_path),
+            "files_dir": str(FILES_DIR),
+            "embed_model": EMBED_MODEL,
+            "chat_model": CHAT_MODEL,
+            "total_docs": total_docs,
+            "total_chunks": chunks,
+            "last_refresh_ts": idx.get("updated_at"),
+            "max_upload_mb": MAX_UPLOAD_MB,
+            "missing_packages": missing,
+        }
+
+
+def get_vs() -> VectorKnowledgeBase:
+    global _vs
+    if _vs is None:
+        _vs = VectorKnowledgeBase(DB_PATH, COLLECTION_NAME)
+    return _vs
+
+# ---- Utility helpers
+
+def log(*args):
+    if LOG_LEVEL in ("DEBUG", "INFO"):
+        print(datetime.utcnow().isoformat(), "|", *args, flush=True)
+
+def errlog(*args):
+    print(datetime.utcnow().isoformat(), "!", *args, file=sys.stderr, flush=True)
+
+def sha256_bytes(data: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(data)
+    return h.hexdigest()
+
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r"[^\w\-. ()\u0590-\u05FF]", "_", name)  # allow Hebrew letters
+    return name[:180]
+
+# ---- File extraction
+
+def extract_text_from_pdf(path: Path) -> Tuple[str, Optional[int]]:
+    if PyPDF2 is None:
+        return "", None
+    try:
+        rdr = PyPDF2.PdfReader(str(path))
+        pages = len(rdr.pages)
+        texts = []
+        for i in range(pages):
+            try:
+                texts.append(rdr.pages[i].extract_text() or "")
+            except Exception:
+                texts.append("")
+        return "\n\n".join(texts), pages
+    except Exception:
+        return "", None
+
+
+def extract_text_from_docx(path: Path) -> str:
+    if docx is None:
+        return ""
+    try:
+        d = docx.Document(str(path))
+        return "\n".join([p.text for p in d.paragraphs])
+    except Exception:
+        return ""
+
+
+def extract_text_from_image(path: Path) -> str:
+    if not OCR_ENABLED or pytesseract is None or Image is None:
+        return ""
+    try:
+        im = Image.open(str(path))
+        return pytesseract.image_to_string(im, lang=OCR_LANG)
+    except Exception:
+        return ""
+
+
+def extract_text_from_csv_xlsx(path: Path) -> str:
+    if pd is None:
+        try:
+            return path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return ""
+    try:
+        if path.suffix.lower() == ".csv":
+            df = pd.read_csv(path)
+        else:
+            df = pd.read_excel(path)
+        # Convert to a compact TSV-like string
+        buf = io.StringIO()
+        df.to_csv(buf, sep='\t', index=False)
+        return buf.getvalue()
+    except Exception:
+        try:
+            return path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+
+def extract_text_generic(path: Path) -> Tuple[str, Optional[int]]:
+    suf = path.suffix.lower()
+    if suf == ".pdf":
+        t, p = extract_text_from_pdf(path)
+        return t, p
+    if suf == ".docx":
+        return extract_text_from_docx(path), None
+    if suf in (".txt", ".md", ".log"):
+        try:
+            return path.read_text(encoding="utf-8", errors="ignore"), None
+        except Exception:
+            return "", None
+    if suf in (".csv", ".xlsx"):
+        return extract_text_from_csv_xlsx(path), None
+    if suf in (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"):
+        return extract_text_from_image(path), None
+    # Unsupported legacy .doc
+    if suf == ".doc":
+        return "[לא נתמך: פורמט .doc ישן]", None
+    # Fallback: try to read as text
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore"), None
+    except Exception:
+        return "", None
+
+# ---- HTTP server
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+
+
+ALLOWED_MIME = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/plain",
+    "text/csv",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "image/jpeg", "image/png", "image/webp", "image/tiff"
+}
+ALLOWED_EXT = {".pdf", ".docx", ".txt", ".csv", ".xlsx", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
+
+
+def allow_origin(origin: Optional[str]) -> Optional[str]:
+    if not CORS_ALLOW_ORIGINS:
+        return "*"
+    if origin and origin in CORS_ALLOW_ORIGINS:
+        return origin
+    return None
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "LOTL/1.0"
+
+
+def _parse_multipart(self):
+    """Parse multipart/form-data request body without cgi.
+    Returns (files, fields) where files is a list of {name, filename, content, content_type}
+    and fields is a dict name -> [values].
+    """
+    length = int(self.headers.get('Content-Length', '0'))
+    if length <= 0:
+        return [], {}
+    body = self.rfile.read(length)
+
+    ctype = self.headers.get('Content-Type', '')
+    m = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', ctype, re.I)
+    if not m:
+        raise ValueError('missing multipart boundary')
+    boundary = m.group(1) or m.group(2)
+    boundary_bytes = b'--' + boundary.encode()
+
+    parts = body.split(boundary_bytes)
+    files, fields = [], {}
+    for part in parts:
+        if not part or part in (b'--', b'--\r\n'):
+            continue
+        if part.startswith(b'\r\n'):
+            part = part[2:]
+        if part.endswith(b'\r\n'):
+            part = part[:-2]
+        if part.endswith(b'--'):
+            part = part[:-2]
+
+        sep = part.find(b'\r\n\r\n')
+        if sep == -1:
+            continue
+        header_block = part[:sep].decode('latin-1', errors='ignore')
+        content = part[sep+4:]
+
+        disp = None
+        ctype_hdr = None
+        for line in header_block.split('\r\n'):
+            low = line.lower()
+            if low.startswith('content-disposition:'):
+                disp = line
+            elif low.startswith('content-type:'):
+                ctype_hdr = line.split(':', 1)[1].strip()
+        if not disp:
+            continue
+
+        name_m = re.search(r'name="([^"]+)"', disp)
+        filename_m = re.search(r'filename="([^"]*)"', disp)
+        name = name_m.group(1) if name_m else None
+        filename = filename_m.group(1) if filename_m else None
+
+        if filename is not None and filename != "":
+            files.append({'name': name, 'filename': filename, 'content': content, 'content_type': ctype_hdr})
+        else:
+            try:
+                value = content.decode('utf-8')
+            except Exception:
+                value = content.decode('latin-1', errors='ignore')
+            fields.setdefault(name, []).append(value)
+    return files, fields
+
+    def _send_headers(self, status=200, content_type="application/json", extra: Optional[Dict[str, str]] = None):
+        self.send_response(status)
+        origin = self.headers.get("Origin")
+        allow = allow_origin(origin)
+        if allow:
+            self.send_header("Access-Control-Allow-Origin", allow)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-LOT-KEY")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Content-Type", content_type)
+        if extra:
+            for k, v in extra.items():
+                self.send_header(k, v)
+        self.end_headers()
+
+    def _send_json(self, obj: Dict[str, Any], status=200):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self._send_headers(status=status, content_type="application/json")
+        self.wfile.write(data)
+
+    def _parse_json(self) -> Dict[str, Any]:
+        n = int(self.headers.get("Content-Length", "0"))
+        if n and n > 50 * 1024 * 1024:  # hard limit for JSON
+            raise ValueError("JSON body too large")
+        body = self.rfile.read(n) if n else b""
+        if not body:
+            return {}
+        try:
+            return json.loads(body.decode("utf-8"))
+        except Exception:
+            raise ValueError("Invalid JSON")
+
+    def _auth_ok(self) -> bool:
+        if not LOT_API_SECRET:
+            return True
+        return self.headers.get("X-LOT-KEY", "") == LOT_API_SECRET
+
+    def do_OPTIONS(self):
+        self._send_headers(204)
+
+    # -------- Routing helpers
+    def _route(self, method: str, path: str):
+        # /health (no auth)
+        if method == "GET" and path == "/health":
+            return self.health()
+
+        # Auth for all other endpoints if secret is set
+        if not self._auth_ok():
+            return self._send_json({"error": "unauthorized"}, status=401)
+
+        # VS endpoints
+        if method == "GET" and path == "/api/vs/stats":
+            return self.vs_stats()
+        if method == "POST" and path == "/api/vs/search":
+            return self.vs_search()
+        if method == "POST" and path == "/api/vs/index":
+            return self.vs_index()
+        if method == "POST" and path == "/api/vs/batch":
+            return self.vs_batch()
+        if method == "POST" and path == "/api/vs/refresh":
+            return self.vs_refresh()
+        if method == "GET" and path.startswith("/api/vs/documents"):
+            return self.vs_documents()
+        if method == "DELETE" and path.startswith("/api/vs/documents/"):
+            return self.vs_document_delete()
+        if method == "GET" and path.startswith("/api/vs/chunks"):
+            return self.vs_chunks()
+        if method == "POST" and path == "/api/vs/purge":
+            return self.vs_purge()
+        if method == "GET" and path == "/":
+            return self.root()
+
+        return self._send_json({"error": "not_found"}, status=404)
+
+    def do_GET(self):
+        try:
+            parsed = urlparse(self.path)
+            self._route("GET", parsed.path)
+        except Exception as e:
+            errlog("GET error", e)
+            self._send_json({"error": "server_error", "detail": str(e)}, status=500)
+
+    def do_POST(self):
+        try:
+            parsed = urlparse(self.path)
+            self._route("POST", parsed.path)
+        except Exception as e:
+            errlog("POST error", e)
+            self._send_json({"error": "server_error", "detail": str(e)}, status=500)
+
+    def do_DELETE(self):
+        try:
+            parsed = urlparse(self.path)
+            self._route("DELETE", parsed.path)
+        except Exception as e:
+            errlog("DELETE error", e)
+            self._send_json({"error": "server_error", "detail": str(e)}, status=500)
+
+    # -------- Handlers
+    def root(self):
+        return self._send_json({"ok": True, "service": "LOTL", "time": datetime.utcnow().isoformat()})
+
+    def health(self):
+        st = {
+            "ok": True,
+            "time": datetime.utcnow().isoformat(),
+            "port": PORT,
+            "have_openai": bool(OPENAI_API_KEY),
+            "missing": missing,
+        }
+        return self._send_json(st)
+
+    def vs_stats(self):
+        try:
+            return self._send_json(get_vs().stats())
+        except Exception as e:
+            return self._send_json({"ok": False, "error": str(e)}, status=500)
+
+    def vs_search(self):
+        try:
+            body = self._parse_json()
+            query = str(body.get("query", "")).strip()
+            top_k = int(body.get("top_k", TOP_K))
+            threshold = float(body.get("threshold", SIM_THRESHOLD))
+            mode = body.get("mode", "semantic")
+            filters = body.get("filters") or {}
+            include_text = bool(body.get("include_text", True))
+            if not query:
+                return self._send_json({"ok": True, "results": []})
+            where = {}
+            for k in ("filename", "tags", "content_type", "doc_id"):
+                if k in filters:
+                    where[k] = {"$in": filters[k]} if isinstance(filters[k], list) else filters[k]
+            results = get_vs().search(query, top_k=top_k, threshold=threshold, where=where, include_text=include_text)
+            return self._send_json({"ok": True, "results": results})
+        except Exception as e:
+            return self._send_json({"ok": False, "error": str(e)}, status=500)
+
+    def _ensure_upload_limit(self) -> None:
+        cl = self.headers.get("Content-Length")
+        if cl is not None:
+            n = int(cl)
+            if n > MAX_UPLOAD_BYTES:
+                self._send_json({"error": "payload_too_large", "limit_mb": MAX_UPLOAD_MB}, status=413)
+                raise RuntimeError("413")
+
+    def vs_index(self):
+        # Enforce overall payload limit (request-size gate)
+        self._ensure_upload_limit()
+        # Validate content type
+        ctype = self.headers.get('Content-Type', '')
+        if 'multipart/form-data' not in (ctype or ''):
+            return self._send_json({"error": "expected multipart/form-data"}, status=415)
+        try:
+            files, fields = self._parse_multipart()
+        except Exception as e:
+            return self._send_json({"error": "multipart_parse_failed", "detail": str(e)}, status=400)
+
+        # Optional fields
+        source_vals = fields.get('source', ['library'])
+        source = source_vals[0] if isinstance(source_vals, list) and source_vals else 'library'
+        tags_vals = fields.get('tags', [''])
+        tags_str = tags_vals[0] if isinstance(tags_vals, list) and tags_vals else ''
+        tags = [t.strip() for t in tags_str.split(',') if t.strip()]
+
+        indexed, skipped = [], []
+        FILES_DIR.mkdir(parents=True, exist_ok=True)
+        date_dir = FILES_DIR / datetime.utcnow().strftime('%y%m%d')
+        date_dir.mkdir(parents=True, exist_ok=True)
+
+        for f in files:
+            try:
+                raw: bytes = f.get('content', b'')
+                filename = f.get('filename') or f"file{int(time.time()*1000)}"
+                if len(raw) > MAX_UPLOAD_BYTES:
+                    skipped.append({"filename": filename, "reason": "too_large"})
+                    continue
+                sha = sha256_bytes(raw)
+                suffix = Path(filename).suffix.lower() or ".bin"
+                if suffix and suffix not in ALLOWED_EXT:
+                    skipped.append({"filename": filename, "reason": "unsupported_extension"})
+                    continue
+                guess = f.get('content_type') or mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+                if guess not in ALLOWED_MIME and suffix not in ALLOWED_EXT:
+                    skipped.append({"filename": filename, "reason": "unsupported_mime"})
+                    continue
+                safe = sanitize_filename(filename)
+                path = date_dir / safe
+                path.write_bytes(raw)
+                text, pages = extract_text_generic(path)
+                doc_id = sha[:16]
+                res = get_vs().index_document(doc_id=doc_id, filename=safe, sha256=sha, content_type=guess, text=text, tags=tags, pages=pages)
+                indexed.append(res)
+            except Exception as e:
+                skipped.append({"filename": f.get('filename'), "reason": str(e)})
+
+        return self._send_json({"ok": True, "indexed": indexed, "skipped": skipped})
+
+    def vs_batch(self):
+        try:
+            body = self._parse_json()
+            urls = body.get("urls") or []
+            paths = body.get("paths") or []
+            source = body.get("source", "library")
+            tags = body.get("tags") or []
+            if requests is None:
+                return self._send_json({"error": "missing 'requests' package"}, status=500)
+            indexed, skipped = [], []
+            FILES_DIR.mkdir(parents=True, exist_ok=True)
+            date_dir = FILES_DIR / datetime.utcnow().strftime("%y%m%d")
+            date_dir.mkdir(parents=True, exist_ok=True)
+            # URLs
+            for u in urls:
+                try:
+                    r = requests.get(u, timeout=TIMEOUT_S)
+                    r.raise_for_status()
+                    raw = r.content
+                    if len(raw) > MAX_UPLOAD_BYTES:
+                        skipped.append({"url": u, "reason": "too_large"})
+                        continue
+                    sha = sha256_bytes(raw)
+                    fn = sanitize_filename(Path(urlparse(u).path).name or f"url_{int(time.time())}")
+                    if not any(fn.lower().endswith(ext) for ext in ALLOWED_EXT):
+                        fn += ".pdf"  # fallback
+                    path = date_dir / fn
+                    path.write_bytes(raw)
+                    text, pages = extract_text_generic(path)
+                    doc_id = sha[:16]
+                    guess = mimetypes.guess_type(fn)[0] or "application/octet-stream"
+                    res = get_vs().index_document(doc_id=doc_id, filename=fn, sha256=sha, content_type=guess, text=text, tags=tags, pages=pages)
+                    indexed.append(res)
+                except Exception as e:
+                    skipped.append({"url": u, "reason": str(e)})
+            # Local paths
+            for p in paths:
+                try:
+                    path = Path(p)
+                    raw = path.read_bytes()
+                    if len(raw) > MAX_UPLOAD_BYTES:
+                        skipped.append({"path": p, "reason": "too_large"})
+                        continue
+                    sha = sha256_bytes(raw)
+                    fn = sanitize_filename(path.name)
+                    dst = date_dir / fn
+                    if path.resolve() != dst.resolve():
+                        dst.write_bytes(raw)
+                    text, pages = extract_text_generic(dst)
+                    doc_id = sha[:16]
+                    guess = mimetypes.guess_type(fn)[0] or "application/octet-stream"
+                    res = get_vs().index_document(doc_id=doc_id, filename=fn, sha256=sha, content_type=guess, text=text, tags=tags, pages=pages)
+                    indexed.append(res)
+                except Exception as e:
+                    skipped.append({"path": p, "reason": str(e)})
+            return self._send_json({"ok": True, "indexed": indexed, "skipped": skipped})
+        except Exception as e:
+            return self._send_json({"ok": False, "error": str(e)}, status=500)
+
+    def vs_refresh(self):
+        try:
+            body = self._parse_json()
+            full = bool(body.get("full", False))
+            vs = get_vs()
+            idx_path = vs.docs_index_path
+            idx = vs._load_docs_index()
+            known = {d.get("sha256"): d for d in idx.get("items", [])}
+            indexed, skipped = [], []
+            for path in FILES_DIR.rglob('*'):
+                if not path.is_file():
+                    continue
+                if path.suffix.lower() not in ALLOWED_EXT:
+                    continue
+                try:
+                    raw = path.read_bytes()
+                    sha = sha256_bytes(raw)
+                    if (not full) and sha in known:
+                        continue
+                    text, pages = extract_text_generic(path)
+                    doc_id = sha[:16]
+                    guess = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                    res = vs.index_document(doc_id=doc_id, filename=path.name, sha256=sha, content_type=guess, text=text, tags=[], pages=pages)
+                    indexed.append(res)
+                except Exception as e:
+                    skipped.append({"filename": path.name, "reason": str(e)})
+            return self._send_json({"ok": True, "indexed": indexed, "skipped": skipped})
+        except Exception as e:
+            return self._send_json({"ok": False, "error": str(e)}, status=500)
+
+    def vs_documents(self):
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        q = (qs.get("query", [""])[0]).strip()
+        ctype = (qs.get("content_type", [None])[0])
+        tag = (qs.get("tag", [None])[0])
+        page = int(qs.get("page", ["1"])[0])
+        page_size = int(qs.get("page_size", ["50"])[0])
+        vs = get_vs()
+        idx = vs._load_docs_index()
+        items = idx.get("items", [])
+        def match(doc):
+            ok = True
+            if q:
+                ok = q.lower() in (doc.get("filename", "").lower())
+            if ok and ctype:
+                ok = (doc.get("content_type") == ctype)
+            if ok and tag:
+                ok = (tag in (doc.get("tags") or []))
+            return ok
+        flt = [d for d in items if match(d)]
+        total = len(flt)
+        start = (page-1)*page_size
+        end = start + page_size
+        return self._send_json({"ok": True, "page": page, "page_size": page_size, "total": total, "items": flt[start:end]})
+
+    def vs_document_delete(self):
+        doc_id = self.path.rsplit("/", 1)[-1]
+        vs = get_vs()
+        try:
+            vs.delete_document(doc_id)
+            return self._send_json({"ok": True, "deleted": doc_id})
+        except Exception as e:
+            return self._send_json({"ok": False, "error": str(e)}, status=500)
+
+    def vs_chunks(self):
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        doc_id = qs.get("doc_id", [None])[0]
+        if not doc_id:
+            return self._send_json({"error": "doc_id required"}, status=400)
+        offset = int(qs.get("offset", ["0"])[0])
+        limit = int(qs.get("limit", ["50"])[0])
+        with_text = (qs.get("with_text", ["true"])[0].lower() != "false")
+        try:
+            return self._send_json(get_vs().list_chunks(doc_id, offset=offset, limit=limit, with_text=with_text))
+        except Exception as e:
+            return self._send_json({"ok": False, "error": str(e)}, status=500)
+
+    def vs_purge(self):
+        try:
+            # Danger: recreate collection and clear docs index
+            vs = get_vs()
+            vs.client.delete_collection(COLLECTION_NAME)
+            _vs = None  # noqa: F841 (hint to recreate on next call)
+            (DB_PATH / "docs_index.json").unlink(missing_ok=True)
+            return self._send_json({"ok": True, "purged": True})
+        except Exception as e:
+            return self._send_json({"ok": False, "error": str(e)}, status=500)
+
+
+# ---- Main
+
+def main():
+    # Ensure dirs
+    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    DB_PATH.mkdir(parents=True, exist_ok=True)
+    # Warm up VS (optional)
+    try:
+        _ = get_vs().stats()
+    except Exception as e:
+        errlog("Vector store init error:", e)
+    # Info
+    log("Service starting on port", PORT)
+    log("DB:", str(DB_PATH), "Collection:", COLLECTION_NAME, "Files:", str(FILES_DIR))
+    if missing:
+        errlog("Missing optional packages:", ", ".join(missing))
+    # Serve
+    httpd = HTTPServer(('0.0.0.0', PORT), Handler)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        log("Shutting down…")
+        httpd.server_close()
+
+
+if __name__ == "__main__":
+    main()

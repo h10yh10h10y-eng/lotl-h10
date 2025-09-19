@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+venv/
+.env.*
+
+# אפליקציה
+app.log
+chroma_db/
+files/uploads/
+*.sqlite
+*.db
+
+# מערכת
+.DS_Store
